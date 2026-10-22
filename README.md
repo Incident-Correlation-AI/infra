@@ -43,7 +43,7 @@ aws configure          # you type credentials; keys never go through chat
 ./infra/scripts/provision.sh
 ```
 
-Chapters `04_…07_` in `../documentations/setups/` are the console-click
+Chapters `04_…07_` in `documentations/setups/` are the console-click
 alternative — the script is the same wiring automated.
 
 **B. Console clicking** — follow those chapters if CLI creds are unavailable.

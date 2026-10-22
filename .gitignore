@@ -1,0 +1,5 @@
+# Secrets never touch this folder; nothing here has them. Still, guard patterns.
+*.zip
+__pycache__/
+*.pyc
+.DS_Store

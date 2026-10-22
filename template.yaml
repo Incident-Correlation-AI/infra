@@ -1,0 +1,181 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Automated Log Anomaly Detector (LAD) - core serverless stack.
+  Pipeline: collectors -> API GW -> IngestFn -> SQS -> WorkerFn -> DynamoDB.
+  Incident read/lifecycle routes are admin-only.
+
+Parameters:
+  Env:
+    Type: String
+    AllowedValues: [dev, demo]
+    Description: Deployment environment; also names the stack (lad-dev / lad-demo).
+  DashboardOrigin:
+    Type: String
+    Description: Exact origin (scheme + host + port) of the dashboard for CORS. Never use '*' with cookies.
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Timeout: 30
+    MemorySize: 512
+    Tracing: Active
+    Environment:
+      Variables:
+        LAD_MODE: aws
+        LAD_ENV: !Ref Env
+        LAD_LOG_LEVEL: !Ref LogLevel
+        INCIDENT_TABLE: !Ref IncidentTable
+        MAIN_QUEUE_URL: !Ref MainQueue
+        DLQ_URL: !Ref DeadLetterQueue
+
+Resources:
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 50
+        ThrottlingRateLimit: 25
+      CorsConfiguration:
+        AllowOrigins:
+          - !Ref DashboardOrigin
+        AllowMethods: [GET, POST, OPTIONS]
+        AllowHeaders: [Authorization, Content-Type, X-Request-Id]
+        AllowCredentials: true
+
+  IngestFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: services.api.ingest.handler
+      Description: Collector-only batch ingestion; validates, redacts, enqueues; returns receipt.
+      Environment:
+        Variables:
+          # Credentials are read from SSM at cold start so rotation needs no stack update.
+          LAD_SSM_PREFIX: !Sub /lad/${Env}
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt MainQueue.QueueName
+        - Statement:
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/lad/${Env}/*
+      Events:
+        BatchIngest:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: POST
+            Path: "/api/v1/events/batch"
+        Health:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: "/api/v1/health"
+
+  IncidentApiFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: services.api.incidents.handler
+      Description: Admin-only incident list/detail/acknowledge/resolve with audit.
+      Environment:
+        Variables:
+          LAD_SSM_PREFIX: !Sub /lad/${Env}
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref IncidentTable
+        - Statement:
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/lad/${Env}/*
+      Events:
+        ListIncidents:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Method: GET, Path: "/api/v1/incidents" }
+        GetIncident:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Method: GET, Path: "/api/v1/incidents/{incident_id}" }
+        AcknowledgeIncident:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Method: POST, Path: "/api/v1/incidents/{incident_id}/acknowledge" }
+        ResolveIncident:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Method: POST, Path: "/api/v1/incidents/{incident_id}/resolve" }
+
+  WorkerFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: services.worker.handler
+      Description: Queue consumer; features -> baseline detection -> correlate -> incidents; idempotent.
+      Environment:
+        Variables:
+          ISOLATION_FOREST_FLAG: off
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref IncidentTable
+        - SQSPollerPolicy:
+            QueueName: !GetAtt MainQueue.QueueName
+        - Statement:
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/lad/${Env}/*
+      Events:
+        QueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt MainQueue.Arn
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 5
+            FunctionResponseTypes: [ReportBatchItemFailures]
+
+  MainQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 120          # >= 2 x WorkerFn.Timeout (30) - prevents double processing
+      MessageRetentionPeriod: 345600  # 4 days backlog cushion
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 5
+
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600 # 14 days for inspection/replay
+
+  IncidentTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk,     AttributeType: S }
+        - { AttributeName: sk,     AttributeType: S }
+        - { AttributeName: gsi1pk, AttributeType: S }
+        - { AttributeName: gsi1sk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: gsi1
+          KeySchema:
+            - { AttributeName: gsi1pk, KeyType: HASH }
+            - { AttributeName: gsi1sk, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      TableClass: STANDARD
+
+Outputs:
+  ApiUrl:
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com
+  MainQueueUrl:
+    Value: !Ref MainQueue
+  DlqUrl:
+    Value: !Ref DeadLetterQueue
+  TableName:
+    Value: !Ref IncidentTable
